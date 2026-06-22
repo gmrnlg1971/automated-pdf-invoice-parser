@@ -3,9 +3,19 @@ import json
 import time
 import threading
 import queue
+import base64
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from pydantic import BaseModel
+import fitz  # PyMuPDF
+from openai import OpenAI
+
+class InvoiceData(BaseModel):
+    invoice_number: str | None
+    vendor_name: str | None
+    total_amount: float | None
+    due_date: str | None
 
 # Absolute paths to ensure it works anywhere
 BASE_DIR = Path(__file__).parent.resolve()
@@ -35,7 +45,7 @@ def is_file_locked(filepath):
         return True
 
 def process_pdf(filepath: Path):
-    """Simulates OCR extraction and saves JSON."""
+    """Uses OpenAI Vision (gpt-4o) to extract invoice data."""
     print(f"[*] Processing: {filepath.name}")
     
     # Wait until file is unlocked
@@ -49,18 +59,40 @@ def process_pdf(filepath: Path):
         return
 
     try:
-        # Simulate processing delay
-        time.sleep(1)
+        doc = fitz.open(str(filepath))
+        if len(doc) == 0:
+            print(f"[X] Empty PDF: {filepath.name}")
+            return
+            
+        page = doc[0]
+        pix = page.get_pixmap(dpi=150)
+        image_bytes = pix.tobytes("jpeg")
+        doc.close()
+
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
+        client = OpenAI()
+        response = client.beta.chat.completions.parse(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Extract the invoice details from this image. Use null if not found. Make sure due_date is YYYY-MM-DD."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                        }
+                    ]
+                }
+            ],
+            response_format=InvoiceData
+        )
         
-        # Mock structured data response
-        structured_data = {
-            "invoice_number": "INV-10294",
-            "vendor_name": "Acme Corp",
-            "total_amount": 1499.99,
-            "due_date": "2026-07-15",
-            "status": "extracted",
-            "original_file": filepath.name
-        }
+        extracted_data = response.choices[0].message.parsed
+        structured_data = extracted_data.model_dump()
+        structured_data["status"] = "extracted"
+        structured_data["original_file"] = filepath.name
         
         # Robust path replacement
         out_filename = filepath.stem + '.json'
